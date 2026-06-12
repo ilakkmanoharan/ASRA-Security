@@ -1,0 +1,11 @@
+# Local private files and secrets
+private/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.aicomp/
+
+# Kaggle
+.kaggle/
