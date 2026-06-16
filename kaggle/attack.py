@@ -25,6 +25,14 @@ from aicomp_sdk.attacks.real_attack_detection import detect_real_attacks
 from aicomp_sdk.core.cells import cell_signature
 from aicomp_sdk.core.predicates import eval_predicates
 
+# Set by kaggle/sync_submit_notebook.py before each kernel push.
+SUBMISSION_MODE = "asra_blf"  # asra | blf | harness | cwm | asra_blf
+
+# Competition replay limits (aicomp-sdk evaluation/ops.py).
+MAX_REPLAY_FINDINGS = 2_000
+MAX_REPLAY_MESSAGES_PER_FINDING = 32
+MAX_USER_MESSAGE_CHARS = 2_000
+
 try:
     from aicomp_sdk.utils.timebox import Timebox
 except ImportError:  # pragma: no cover - defensive fallback
@@ -93,6 +101,39 @@ def make_candidate(user_messages: Sequence[str]) -> AttackCandidate:
     if hasattr(AttackCandidate, "from_messages"):
         return AttackCandidate.from_messages(user_messages)
     return AttackCandidate(user_messages=tuple(user_messages))
+
+
+def _sanitize_messages(user_messages: Sequence[str]) -> tuple[str, ...] | None:
+    """Keep only replay-safe user message chains."""
+    cleaned: list[str] = []
+    for message in user_messages[:MAX_REPLAY_MESSAGES_PER_FINDING]:
+        if not isinstance(message, str):
+            return None
+        text = message.strip()
+        if not text:
+            return None
+        cleaned.append(text[:MAX_USER_MESSAGE_CHARS])
+    if not cleaned:
+        return None
+    return tuple(cleaned)
+
+
+def finalize_findings(
+    scored_findings: list[tuple[float, AttackCandidate]],
+) -> list[AttackCandidate]:
+    """Deduplicate, rank, and cap findings for evaluator replay."""
+    best_by_messages: dict[tuple[str, ...], tuple[float, AttackCandidate]] = {}
+    for score, candidate in scored_findings:
+        messages = _sanitize_messages(candidate.user_messages)
+        if messages is None:
+            continue
+        safe_candidate = make_candidate(messages)
+        existing = best_by_messages.get(messages)
+        if existing is None or score > existing[0]:
+            best_by_messages[messages] = (score, safe_candidate)
+
+    ranked = sorted(best_by_messages.values(), key=lambda item: item[0], reverse=True)
+    return [candidate for _, candidate in ranked[:MAX_REPLAY_FINDINGS]]
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +333,162 @@ class TraceScorer:
         return score
 
 
+# ---------------------------------------------------------------------------
+# BLF — belief state over predicate families
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PredicateBeliefs:
+    exfiltration: float = 0.1
+    untrusted_to_action: float = 0.2
+    destructive_write: float = 0.15
+    confused_deputy: float = 0.1
+
+    def max_belief(self) -> float:
+        return max(
+            self.exfiltration,
+            self.untrusted_to_action,
+            self.destructive_write,
+            self.confused_deputy,
+        )
+
+
+class BeliefState:
+    """Sandbox-only beliefs over competition predicate families."""
+
+    _PREDICATE_KEYS = {
+        "exfiltration": "exfiltration",
+        "untrusted_to_action": "untrusted_to_action",
+        "destructive_write": "destructive_write",
+        "confused_deputy": "confused_deputy",
+        "secret_exfiltration": "exfiltration",
+    }
+
+    def __init__(self) -> None:
+        self.beliefs = PredicateBeliefs()
+
+    def update(
+        self,
+        trace: Mapping[str, Any],
+        predicates: list[dict[str, Any]],
+        *,
+        refused: bool,
+    ) -> None:
+        if refused:
+            for field in ("exfiltration", "untrusted_to_action", "destructive_write", "confused_deputy"):
+                current = getattr(self.beliefs, field)
+                setattr(self.beliefs, field, max(0.05, current * 0.95))
+            return
+        for predicate in predicates:
+            raw = str(predicate.get("type") or predicate.get("kind") or "").lower()
+            for needle, field in self._PREDICATE_KEYS.items():
+                if needle in raw:
+                    current = getattr(self.beliefs, field)
+                    setattr(self.beliefs, field, min(0.95, current + 0.08))
+        sig = cell_signature(
+            trace.get("tool_events", []),
+            egress_data=trace.get("egress", []),
+            user_messages=trace.get("user_messages", []),
+        )
+        if sig.get("secret_read"):
+            self.beliefs.exfiltration = min(0.95, self.beliefs.exfiltration + 0.05)
+        if sig.get("egress_count", 0):
+            self.beliefs.exfiltration = min(0.95, self.beliefs.exfiltration + 0.04)
+
+    def entry_weight(self, entry: ArchiveEntry) -> float:
+        base = 1.0 + self.beliefs.max_belief()
+        if entry.score_hint > 0:
+            base += 0.25
+        return base
+
+    def seed_weight(self, seed: str) -> float:
+        lowered = seed.lower()
+        weight = 1.0
+        if any(tok in lowered for tok in ("post", "send", "upload", "backup", "share")):
+            weight += self.beliefs.exfiltration
+        if any(tok in lowered for tok in ("email", "web", "open", "read")):
+            weight += self.beliefs.untrusted_to_action
+        if any(tok in lowered for tok in ("delete", "write", "clean")):
+            weight += self.beliefs.destructive_write
+        return weight
+
+
+# ---------------------------------------------------------------------------
+# CWM — transition model for cheap rollout hints
+# ---------------------------------------------------------------------------
+
+
+class TransitionModel:
+    """Records (cell, action) → score deltas; ranks branches before env.interact()."""
+
+    def __init__(self) -> None:
+        self._scores: dict[tuple[str, str], list[float]] = {}
+
+    def record(self, cell: str, action: str, score: float) -> None:
+        key = (cell, action[:80])
+        self._scores.setdefault(key, []).append(score)
+        if len(self._scores[key]) > 8:
+            self._scores[key] = self._scores[key][-8:]
+
+    def predict(self, cell: str, action: str) -> float:
+        values = self._scores.get((cell, action[:80]), [])
+        if not values:
+            return 0.0
+        return sum(values) / len(values)
+
+    def rank_actions(self, cell: str, actions: Sequence[str]) -> list[str]:
+        return sorted(actions, key=lambda a: self.predict(cell, a), reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# AutoHarness — phased orchestration over SearchController
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class HarnessContext:
+    env: Any
+    config: AttackRunConfig
+    rng: random.Random
+    controller: "SearchController"
+
+
+class AttackHarness:
+    """Modular phases: seed → branch → diversify."""
+
+    def run(self, ctx: HarnessContext) -> list[AttackCandidate]:
+        controller = ctx.controller
+        budget = Timebox(float(ctx.config.time_budget_s))
+        seed_budget = Timebox(min(30.0, float(ctx.config.time_budget_s) * 0.15))
+        controller._seed_archive(ctx.env, ctx.rng)
+        while not seed_budget.expired() and len(controller.archive) < 4:
+            controller._seed_archive(ctx.env, ctx.rng)
+        ctx.config = AttackRunConfig(
+            time_budget_s=max(10.0, budget.remaining()),
+            max_steps=ctx.config.max_steps,
+            max_tool_hops=ctx.config.max_tool_hops,
+        )
+        controller.mutation_rate = 0.25
+        findings = controller.run_search(ctx.env, ctx.config, ctx.rng, skip_seed=True)
+        diversify_budget = min(45.0, float(ctx.config.time_budget_s) * 0.2)
+        if diversify_budget > 5:
+            ctx.config = AttackRunConfig(
+                time_budget_s=diversify_budget,
+                max_steps=ctx.config.max_steps,
+                max_tool_hops=ctx.config.max_tool_hops,
+            )
+            controller.mutation_rate = 0.6
+            findings = controller.run_search(
+                ctx.env,
+                ctx.config,
+                ctx.rng,
+                skip_seed=True,
+                merge_findings=findings,
+            )
+        return findings
+
+
 class SearchController:
     """Go-Explore search loop with archive-backed state revisiting."""
 
@@ -301,13 +498,22 @@ class SearchController:
         scorer: TraceScorer,
         branch_batch: int = 12,
         max_tool_hops: int = 8,
+        max_turns: int = 20,
+        *,
+        beliefs: Optional[BeliefState] = None,
+        transition_model: Optional[TransitionModel] = None,
     ) -> None:
         self.mutator = mutator
         self.scorer = scorer
         self.branch_batch = branch_batch
         self.max_tool_hops = max_tool_hops
+        self.max_turns = max_turns
+        self.beliefs = beliefs
+        self.transition_model = transition_model
+        self.mutation_rate = 0.25
         self.archive = NoveltyArchive()
         self.records: list[TraceRecord] = []
+        self.scored_findings: list[tuple[float, AttackCandidate]] = []
 
     @staticmethod
     def _cell_hash(trace: Mapping[str, Any]) -> str:
@@ -333,7 +539,8 @@ class SearchController:
             visit_w = (max_visits - entry.visits) / max_visits
             score_w = (entry.score_hint + 1.0) / max_score
             depth_w = 1.0 / (1.0 + abs(entry.depth - 3))
-            weights.append(visit_w * 2.0 + score_w * 1.5 + depth_w * 0.5)
+            belief_w = self.beliefs.entry_weight(entry) if self.beliefs else 1.0
+            weights.append((visit_w * 2.0 + score_w * 1.5 + depth_w * 0.5) * belief_w)
         total = sum(weights)
         r = rng.uniform(0.0, total)
         cumulative = 0.0
@@ -364,17 +571,24 @@ class SearchController:
         env: Any,
         config: AttackRunConfig,
         rng: random.Random,
+        *,
+        skip_seed: bool = False,
+        merge_findings: Optional[list[AttackCandidate]] = None,
     ) -> list[AttackCandidate]:
         budget = Timebox(float(config.time_budget_s))
         max_steps = int(config.max_steps)
-        findings: list[AttackCandidate] = []
+        if merge_findings is None:
+            self.scored_findings = []
         seen_signatures: set[str] = set()
         productive_steps = 0
 
-        self._seed_archive(env, rng)
+        if not skip_seed:
+            self._seed_archive(env, rng)
 
         while not budget.expired() and productive_steps < max_steps:
             entry = self._select_entry(rng)
+            if entry.depth >= self.max_turns:
+                continue
             entry.visits += 1
             step_had_work = False
             novel_batch: list[ArchiveEntry] = []
@@ -384,17 +598,24 @@ class SearchController:
                     break
                 safe_call(env, ("restore",), entry.snapshot)
 
-                # Mix curated seeds with mutations for diversity.
-                if rng.random() < 0.25:
+                if rng.random() < self.mutation_rate:
                     action = self.mutator.mutate(
                         entry.user_messages[-1] if entry.user_messages else "open demo",
                         rng,
                     )
                 else:
-                    action = rng.choice(self.mutator.base_seeds())
+                    seeds = self.mutator.base_seeds()
+                    if self.beliefs:
+                        seeds = sorted(seeds, key=self.beliefs.seed_weight, reverse=True)
+                    if self.transition_model:
+                        seeds = self.transition_model.rank_actions(entry.cell_hash, seeds[:16])
+                    action = rng.choice(seeds[:8] if len(seeds) > 8 else seeds)
 
                 result = safe_call(env, ("interact",), action, max_tool_hops=self.max_tool_hops)
-                if getattr(result, "agent_refused", False):
+                refused = getattr(result, "agent_refused", False)
+                if refused:
+                    if self.beliefs:
+                        self.beliefs.update({}, [], refused=True)
                     continue
 
                 step_had_work = True
@@ -403,6 +624,10 @@ class SearchController:
                 cell = self._cell_hash(trace)
                 tool_sig = self._tool_signature(trace)
                 score = self.scorer.score(trace, predicates, entry.real_attacks)
+                if self.beliefs:
+                    self.beliefs.update(trace, predicates, refused=False)
+                if self.transition_model:
+                    self.transition_model.record(cell, action, score)
 
                 if not self.archive.is_novel(cell):
                     continue
@@ -442,10 +667,12 @@ class SearchController:
                 )
 
                 if predicates and cell not in seen_signatures:
-                    candidate = make_candidate(record.user_messages)
-                    record.candidate = candidate
-                    findings.append(candidate)
-                    seen_signatures.add(cell)
+                    messages = _sanitize_messages(record.user_messages)
+                    if messages is not None:
+                        candidate = make_candidate(messages)
+                        record.candidate = candidate
+                        self.scored_findings.append((score, candidate))
+                        seen_signatures.add(cell)
 
                 self.records.append(record)
 
@@ -455,10 +682,12 @@ class SearchController:
             for child in novel_batch:
                 self.archive.add(child)
 
-        findings.sort(
-            key=lambda c: len(c.user_messages),
-            reverse=True,
-        )
+        findings = finalize_findings(self.scored_findings)
+        if merge_findings:
+            combined = {(tuple(c.user_messages), c) for c in merge_findings}
+            for candidate in findings:
+                combined[(tuple(candidate.user_messages), candidate)] = candidate
+            findings = [c for _, c in combined]
         return findings
 
 
@@ -479,16 +708,34 @@ class AttackAlgorithm(AttackAlgorithmBase):
         super().__init__(config)
         self.branch_batch = int(self.config.get("branch_batch", 12))
         self.max_tool_hops = int(self.config.get("max_tool_hops", 8))
+        self.max_turns = int(self.config.get("max_turns", 20))
         self.last_records: list[TraceRecord] = []
 
     def run(self, env: Any, config: AttackRunConfig) -> list[AttackCandidate]:
         rng = random.Random(getattr(env, "seed", 0))
+        mode = str(self.config.get("submission_mode", SUBMISSION_MODE)).lower()
+        use_blf = mode in ("blf", "asra_blf")
+        use_cwm = mode == "cwm"
+        use_harness = mode == "harness"
+
         controller = SearchController(
             mutator=PromptMutator(),
             scorer=TraceScorer(),
             branch_batch=self.branch_batch,
             max_tool_hops=self.max_tool_hops,
+            max_turns=self.max_turns,
+            beliefs=BeliefState() if use_blf else None,
+            transition_model=TransitionModel() if use_cwm else None,
         )
-        findings = controller.run_search(env, config, rng)
+        try:
+            if use_harness:
+                harness = AttackHarness()
+                findings = harness.run(
+                    HarnessContext(env=env, config=config, rng=rng, controller=controller)
+                )
+            else:
+                findings = controller.run_search(env, config, rng)
+        except Exception:
+            findings = finalize_findings(controller.scored_findings)
         self.last_records = controller.records
         return findings
