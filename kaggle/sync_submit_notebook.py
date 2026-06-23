@@ -68,7 +68,7 @@ def main() -> None:
     parser.add_argument(
         "--mode",
         required=True,
-        choices=["asra", "blf", "harness", "cwm", "asra_blf"],
+        choices=["asra", "blf", "harness", "cwm", "asra_blf", "blf_harness"],
     )
     args = parser.parse_args()
     sync_notebook(args.mode)

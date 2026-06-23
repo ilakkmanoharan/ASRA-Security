@@ -26,7 +26,7 @@ from aicomp_sdk.core.cells import cell_signature
 from aicomp_sdk.core.predicates import eval_predicates
 
 # Set by kaggle/sync_submit_notebook.py before each kernel push.
-SUBMISSION_MODE = "asra"  # asra | blf | harness | cwm | asra_blf
+SUBMISSION_MODE = "asra"  # asra | blf | harness | cwm | asra_blf | blf_harness
 
 # Competition replay limits (aicomp-sdk evaluation/ops.py).
 MAX_REPLAY_FINDINGS = 2_000
@@ -714,9 +714,9 @@ class AttackAlgorithm(AttackAlgorithmBase):
     def run(self, env: Any, config: AttackRunConfig) -> list[AttackCandidate]:
         rng = random.Random(getattr(env, "seed", 0))
         mode = str(self.config.get("submission_mode", SUBMISSION_MODE)).lower()
-        use_blf = mode in ("blf", "asra_blf")
+        use_blf = mode in ("blf", "asra_blf", "blf_harness")
         use_cwm = mode == "cwm"
-        use_harness = mode == "harness"
+        use_harness = mode in ("harness", "blf_harness")
 
         controller = SearchController(
             mutator=PromptMutator(),

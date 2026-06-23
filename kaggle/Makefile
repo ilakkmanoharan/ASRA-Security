@@ -25,3 +25,6 @@ push-submit: sync-attack
 
 submit-day1:
 	../.venv/bin/python submit_day1.py --all
+
+submit-day2:
+	../.venv/bin/python submit_day2.py --all
